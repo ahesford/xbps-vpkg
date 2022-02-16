@@ -1,0 +1,137 @@
+#!/bin/sh
+
+usage_short() {
+	echo "USAGE: $0 [-l license] [-s shortdesc] <pkgname> <deps> ..."
+}
+
+usage() {
+	usage_short
+
+	cat <<-EOF
+
+	Create a virtual package with the given name and dependencies.
+
+	If <pkgname> does not contain a "-<version>_<revision>" suffix, one
+	will be created based on the current date.
+
+	Each dependency will have a '>=0' version requirement appended if it
+	does not appear to specify a version requirement.
+
+	A public domain license is set by default; you can override with -l,
+	but why do you care about this?!?
+
+	A generic "Virtual package group" is specified as a short description,
+	but this can be overridden with -s.
+	EOF
+}
+
+cleanup() {
+	[ -d "${workdir}" ] && rm -rf "${workdir}"
+	unset workdir
+}
+
+get_maintainer() {
+	local user host real
+
+	host="$(hostname 2>/dev/null)"
+	user="$(id -un 2>/dev/null)"
+	real="$(getent passwd ajh 2>/dev/null | cut -d: -f5)"
+
+	echo "${real:-Local User} <${user:-user}@${host:-localhost}>"
+}
+
+has_version() {
+	pkg="${1?a package is required}"
+	xbps-uhelper getpkgversion "${pkg}" >/dev/null 2>&1
+}
+
+as_root() {
+	# The sudo test was shamelessly stolen from xi in xtools
+	if command -v doas >/dev/null 2>&1; then
+		doas "$@"
+	elif command -v sudo >/dev/null 2>&1; then
+		sudo "$@"
+	elif [ "$(id -u)" = 0 ]; then
+		"$@"
+	else
+		echo "ERROR: no permission to install"
+		return 1
+	fi
+}
+
+unset workdir
+trap cleanup EXIT TERM INT QUIT
+
+workdir="$(mktemp -d)" || exit
+mkdir -p "${workdir}/root" || exit
+
+license="Public Domain"
+shortdesc="Virtual package group"
+
+while getopts "s:l:h" opt; do
+	case "${opt}" in
+		s)
+			shortdesc="${OPTARG}"
+			;;
+		l)
+			license="${OPTARG}"
+			;;
+		h)
+			usage
+			exit 0
+			;;
+		*)
+			usage
+			exit 1
+			;;
+	esac
+done
+
+shift "$((OPTIND - 1))"
+
+pkgver="$1"
+if [ -z "${pkgver}" ]; then
+	echo "ERROR: no pkgname provided"
+	usage_short
+	exit 1
+fi
+
+shift
+
+deps=""
+for pkg in "$@"; do
+	[ -n "${pkg}" ] || continue
+
+	# Add a version restriction if none exists
+	case "${pkg}" in
+		*"<"*|*">"*) ;;
+		*) has_version "${pkg}" || pkg="${pkg}>=0" ;;
+	esac
+
+	if [ -z "${deps}" ]; then
+		deps="${pkg}"
+	else
+		deps="${deps} ${pkg}"
+	fi
+done
+
+if [ -z "${deps}" ]; then
+	echo "ERROR: no dependencies provided"
+	usage_short
+	exit 1
+fi
+
+# Make sure the package has a version part
+has_version "${pkgver}" || pkgver="${pkgver}-$(date +"%Y%m%d")_1"
+
+# xbps-create dumps packages in the current directory
+(
+	cd "${workdir}" && \
+	xbps-create -A noarch -l "${license}" \
+		-m "$(get_maintainer)" -s "${shortdesc}" \
+		-D "${deps}" -n "${pkgver}" "${workdir}/root"
+) || exit
+
+xbps-rindex -a "${workdir}/${pkgver}.noarch.xbps" || exit
+
+as_root xbps-install -R "${workdir}" -u "${pkgver}"
